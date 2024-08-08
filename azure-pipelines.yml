@@ -72,14 +72,11 @@ jobs:
         CI_JOB: release
         PLATFORM: macos
   steps:
-    - script: |
-        brew uninstall llvm
-      displayName: macOS Uninstall LLVM
     - template: '.ci/test.yml'
     - template: '.ci/release.yml'
 - job: windows
   pool:
-    vmImage: windows-latest
+    vmImage: windows-2019
   strategy:
     matrix:
       test:

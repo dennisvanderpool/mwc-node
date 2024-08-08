@@ -1,4 +1,4 @@
-// Copyright 2020 The Grin Developers
+// Copyright 2021 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,6 @@ use grin_pool as pool;
 
 use grin_util as util;
 
-use failure;
-#[macro_use]
-extern crate failure_derive;
 #[macro_use]
 extern crate lazy_static;
 
@@ -36,15 +33,16 @@ mod web;
 pub mod auth;
 pub mod client;
 mod foreign;
-mod foreign_rpc;
+pub mod foreign_rpc;
 mod handlers;
+pub mod json_rpc;
 mod owner;
-mod owner_rpc;
+pub mod owner_rpc;
 mod rest;
 mod router;
 mod stratum;
 mod stratum_rpc;
-mod types;
+pub mod types;
 
 pub use crate::auth::{
 	BasicAuthMiddleware, BasicAuthURIMiddleware, MWC_BASIC_REALM, MWC_FOREIGN_BASIC_REALM,
