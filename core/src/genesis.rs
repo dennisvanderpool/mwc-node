@@ -1,4 +1,5 @@
-// Copyright 2021 The Grin Developers
+// Copyright 2019 The Grin Developers
+// Copyright 2024 The MWC Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,8 +17,6 @@
 
 // required for genesis replacement
 //! #![allow(unused_imports)]
-
-#![cfg_attr(feature = "cargo-clippy", allow(clippy::unreadable_literal))]
 
 use crate::core;
 use crate::core::hash::Hash;

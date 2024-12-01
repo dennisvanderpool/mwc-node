@@ -1,4 +1,5 @@
-// Copyright 2021 The Grin Developers
+// Copyright 2019 The Grin Developers
+// Copyright 2024 The MWC Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -45,7 +46,7 @@ use crate::util::secp::pedersen::RangeProof;
 use crate::util::OneTime;
 use chrono::prelude::*;
 use chrono::Duration;
-use grin_chain::txhashset::Segmenter;
+use mwc_chain::txhashset::Segmenter;
 use rand::prelude::*;
 use std::ops::Range;
 use std::sync::atomic::AtomicI64;
@@ -210,10 +211,16 @@ where
 			return Ok(true);
 		}
 
+		let total_blocks = match self.chain().header_head() {
+			Ok(tip) => tip.height,
+			Err(_) => 0,
+		};
+
 		info!(
-			"Received block {} at {} from {} [in/out/kern: {}/{}/{}] going to process.",
-			b.hash(),
+			"Received block {} of {} hash {} from {} [in/out/kern: {}/{}/{}] going to process.",
 			b.header.height,
+			total_blocks,
+			b.hash(),
 			peer_info.addr,
 			b.inputs().len(),
 			b.outputs().len(),
@@ -395,12 +402,6 @@ where
 		bhs: &[core::BlockHeader],
 		peer_info: &PeerInfo,
 	) -> Result<bool, chain::Error> {
-		info!(
-			"Received {} block headers from {}",
-			bhs.len(),
-			peer_info.addr
-		);
-
 		if bhs.is_empty() {
 			return Ok(false);
 		}
@@ -409,6 +410,13 @@ where
 			debug!("headers_received: found known bad header, all data is rejected");
 			return Ok(false);
 		}
+
+		info!(
+			"Received {} block headers from {}, height {}",
+			bhs.len(),
+			peer_info.addr,
+			bhs[0].height,
+		);
 
 		// Read our sync_head if we are in header_sync.
 		// If not then we can ignore this batch of headers.

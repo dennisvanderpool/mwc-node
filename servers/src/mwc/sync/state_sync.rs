@@ -1,4 +1,5 @@
-// Copyright 2021 The Grin Developers
+// Copyright 2019 The Grin Developers
+// Copyright 2024 The MWC Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,12 +15,13 @@
 
 use chrono::prelude::{DateTime, Utc};
 use chrono::Duration;
-use grin_core::core::hash::Hash;
-use grin_core::core::BlockHeader;
-use grin_p2p::ReasonForBan;
-use grin_util::secp::rand::Rng;
+use mwc_core::core::hash::Hash;
+use mwc_core::core::BlockHeader;
+use mwc_p2p::ReasonForBan;
+use mwc_util::secp::rand::Rng;
 use rand::seq::SliceRandom;
 use std::sync::Arc;
+use std::{thread, time};
 
 use crate::chain::{self, pibd_params, SyncState, SyncStatus};
 use crate::core::core::{hash::Hashed, pmmr::segment::SegmentType};
@@ -246,6 +248,10 @@ impl StateSync {
 				}
 
 				if has_segmenter {
+					// Sleeping some extra time because checking request is CPU time consuming, not much optimization
+					// going through all the data. That is why at lease let's not over do with that.
+					thread::sleep(time::Duration::from_millis(500));
+
 					// Continue our PIBD process (which returns true if all segments are in)
 					match self.continue_pibd(&archive_header) {
 						Ok(true) => {
@@ -482,7 +488,7 @@ impl StateSync {
 
 	/// Continue the PIBD process, returning true if the desegmenter is reporting
 	/// that the process is done
-	fn continue_pibd(&mut self, archive_header: &BlockHeader) -> Result<bool, grin_chain::Error> {
+	fn continue_pibd(&mut self, archive_header: &BlockHeader) -> Result<bool, mwc_chain::Error> {
 		// Check the state of our chain to figure out what we should be requesting next
 		let desegmenter = self.chain.get_desegmenter(&archive_header);
 
