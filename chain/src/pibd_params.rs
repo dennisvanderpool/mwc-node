@@ -20,37 +20,29 @@
 use chrono::{DateTime, Utc};
 use mwc_util::RwLock;
 use std::cmp;
-use std::ops::Range;
 use std::sync::Arc;
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
-/// Segment heights for Header Hashes
-pub const HEADERS_HASHES_SEGMENT_HEIGHT_RANGE: Range<u8> = 10..13; // ~32b
-/// Segment heights for kernels
-pub const KERNEL_SEGMENT_HEIGHT_RANGE: Range<u8> = 8..11; // ~ 100 b
-/// Segment heights for output bitmaps
-pub const BITMAP_SEGMENT_HEIGHT_RANGE: Range<u8> = 8..11; // ~ 128 b
-/// Segment heights for outputs
-pub const OUTPUT_SEGMENT_HEIGHT_RANGE: Range<u8> = 10..13; // ~ 33 b
-/// Segment heights for rangeproofs
-pub const RANGEPROOF_SEGMENT_HEIGHT_RANGE: Range<u8> = 6..9; // ~ 675 b
+/// Segment heights for Header Hashes. Note, this number is needs to be the same for all network
+pub const PIBD_MESSAGE_SIZE_LIMIT: usize = 256 * 1034; // Let's use 256k messages max. I think we should be good to handle that
 
 // Here are series for different available resources. Mem and CPU thresholds are allways the same.
 const HEADERS_HASH_BUFFER_LEN: [usize; 4] = [10, 20, 30, 60];
+
+const HEADERS_BUFFER_LEN: [usize; 4] = [50, 100, 250, 400];
 const BITMAPS_BUFFER_LEN: [usize; 4] = [10, 20, 30, 40];
 
-const OUTPUTS_BUFFER_LEN: [usize; 4] = [7, 15, 30, 40];
-const KERNELS_BUFFER_LEN: [usize; 4] = [7, 15, 30, 40];
-const RANGEPROOFS_BUFFER_LEN: [usize; 4] = [7, 15, 30, 40];
+// segment size are from around 30-40 kB. Then double for every level
+const SEGMENTS_BUFFER_LEN: [usize; 4] = [30, 40, 50, 60];
 
 // One block can be up to 1.5Mb in size. We still need some to run the node
 const ORPHANS_BUFFER_LEN: [usize; 4] = [20, 100, 250, 500];
 
-const SEGMENTS_REQUEST_LIMIT: [usize; 4] = [20, 40, 80, 120];
+const SEGMENTS_REQUEST_LIMIT: [usize; 4] = [20, 30, 40, 40];
 
 /// How long the state sync should wait after requesting a segment from a peer before
 /// deciding the segment isn't going to arrive. The syncer will then re-request the segment
-pub const SEGMENT_REQUEST_TIMEOUT_SECS: i64 = 60;
+pub const PIBD_REQUESTS_TIMEOUT_SECS: i64 = 30;
 
 struct SysMemoryInfo {
 	available_memory_mb: u64,
@@ -71,16 +63,16 @@ impl SysMemoryInfo {
 	}
 }
 
+struct NetworkSpeed {
+	last_network_speed_update: DateTime<Utc>,
+	network_speed_multiplier: f64,
+}
+
 /// Pibd Sync related params. Note, most of settings are dynamic calculated to match available resources.
 pub struct PibdParams {
 	cpu_num: usize,
 	sys_memory_info: Arc<RwLock<SysMemoryInfo>>,
-
-	bitmap_segment_height: u8,
-	headers_segment_height: u8,
-	output_segment_height: u8,
-	rangeproof_segment_height: u8,
-	kernel_segment_height: u8,
+	network_speed: RwLock<NetworkSpeed>,
 }
 
 impl PibdParams {
@@ -90,63 +82,33 @@ impl PibdParams {
 		let mem_info = SysMemoryInfo::update();
 		let res = PibdParams {
 			cpu_num: num_cores,
-			bitmap_segment_height: Self::calc_mem_adequate_val(
-				&BITMAP_SEGMENT_HEIGHT_RANGE,
-				mem_info.available_memory_mb,
-				num_cores,
-			),
-			headers_segment_height: Self::calc_mem_adequate_val(
-				&HEADERS_HASHES_SEGMENT_HEIGHT_RANGE,
-				mem_info.available_memory_mb,
-				num_cores,
-			),
-			output_segment_height: Self::calc_mem_adequate_val(
-				&OUTPUT_SEGMENT_HEIGHT_RANGE,
-				mem_info.available_memory_mb,
-				num_cores,
-			),
-			rangeproof_segment_height: Self::calc_mem_adequate_val(
-				&RANGEPROOF_SEGMENT_HEIGHT_RANGE,
-				mem_info.available_memory_mb,
-				num_cores,
-			),
-			kernel_segment_height: Self::calc_mem_adequate_val(
-				&KERNEL_SEGMENT_HEIGHT_RANGE,
-				mem_info.available_memory_mb,
-				num_cores,
-			),
 			sys_memory_info: Arc::new(RwLock::new(mem_info)),
+			network_speed: RwLock::new(NetworkSpeed {
+				last_network_speed_update: Utc::now(),
+				network_speed_multiplier: 1.0,
+			}),
 		};
-		debug!("PibdParams config: cpu_num={}, bitmap_segment_height={}, headers_segment_height={}, output_segment_height={}, rangeproof_segment_height={}, kernel_segment_height={}, available_memory_mb={}",
-			res.cpu_num, res.bitmap_segment_height, res.headers_segment_height, res.output_segment_height, res.rangeproof_segment_height, res.kernel_segment_height, res.sys_memory_info.read().available_memory_mb );
+		debug!(
+			"PibdParams config: cpu_num={}, available_memory_mb={}",
+			res.cpu_num,
+			res.sys_memory_info.read().available_memory_mb
+		);
 		res
-	}
-
-	/// Get segment height for output bitmaps
-	pub fn get_bitmap_segment_height(&self) -> u8 {
-		self.bitmap_segment_height
-	}
-	/// Get segment height for header hashes
-	pub fn get_headers_segment_height(&self) -> u8 {
-		self.headers_segment_height
-	}
-	/// Get segment height for outputs
-	pub fn get_output_segment_height(&self) -> u8 {
-		self.output_segment_height
-	}
-	/// Get segment height for rangeproofs
-	pub fn get_rangeproof_segment_height(&self) -> u8 {
-		self.rangeproof_segment_height
-	}
-	/// Get segment height for kernels
-	pub fn get_kernel_segment_height(&self) -> u8 {
-		self.kernel_segment_height
 	}
 
 	/// Buffer size for header hashes
 	pub fn get_headers_hash_buffer_len(&self) -> usize {
 		Self::calc_mem_adequate_val2(
 			&HEADERS_HASH_BUFFER_LEN,
+			self.get_available_memory_mb(),
+			self.cpu_num,
+		)
+	}
+
+	/// Buffer size for headers
+	pub fn get_headers_buffer_len(&self) -> usize {
+		Self::calc_mem_adequate_val2(
+			&HEADERS_BUFFER_LEN,
 			self.get_available_memory_mb(),
 			self.cpu_num,
 		)
@@ -162,33 +124,12 @@ impl PibdParams {
 	}
 
 	/// Buffer size for outputs
-	pub fn get_outputs_buffer_len(&self, non_complete_num: usize) -> usize {
-		let k = if non_complete_num <= 1 { 2 } else { 1 };
+	pub fn get_segments_buffer_len(&self) -> usize {
 		Self::calc_mem_adequate_val2(
-			&OUTPUTS_BUFFER_LEN,
+			&SEGMENTS_BUFFER_LEN,
 			self.get_available_memory_mb(),
 			self.cpu_num,
-		) * k
-	}
-
-	/// Buffer size for kernels
-	pub fn get_kernels_buffer_len(&self, non_complete_num: usize) -> usize {
-		let k = if non_complete_num <= 1 { 2 } else { 1 };
-		Self::calc_mem_adequate_val2(
-			&KERNELS_BUFFER_LEN,
-			self.get_available_memory_mb(),
-			self.cpu_num,
-		) * k
-	}
-
-	/// Buffer size for rangeproofs
-	pub fn get_rangeproofs_buffer_len(&self, non_complete_num: usize) -> usize {
-		let k = if non_complete_num <= 1 { 2 } else { 1 };
-		Self::calc_mem_adequate_val2(
-			&RANGEPROOFS_BUFFER_LEN,
-			self.get_available_memory_mb(),
-			self.cpu_num,
-		) * k
+		)
 	}
 
 	/// Man number of orphans to keep
@@ -202,37 +143,71 @@ impl PibdParams {
 
 	/// Number of simultaneous requests for blocks we should make per available peer.
 	pub fn get_blocks_request_per_peer(&self) -> usize {
-		match self.cpu_num {
-			1 => 3,
-			2 => 6,
-			_ => 15,
-		}
+		cmp::min(8, self.cpu_num * 2)
 	}
 
 	/// Maxumum number of blocks that can await into the DB as orphans
-	pub fn get_blocks_request_limit(&self) -> usize {
-		self.get_orphans_num_limit() / 2
+	pub fn get_blocks_request_limit(&self, average_latency_ms: u32) -> usize {
+		let req_limit = self.get_orphans_num_limit() / 2;
+		cmp::max(
+			1,
+			(req_limit as f64 * self.get_network_speed_multiplier(average_latency_ms)).round()
+				as usize,
+		)
 	}
 
 	/// Number of simultaneous requests for segments we should make per available peer. Note this is currently
 	/// divisible by 3 to try and evenly spread requests amount the 3 main MMRs (Bitmap segments
 	/// will always be requested first)
 	pub fn get_segments_request_per_peer(&self) -> usize {
-		match self.cpu_num {
-			1 => 2,
-			2 => 4,
-			_ => 6,
-		}
+		cmp::min(8, self.cpu_num * 2)
 	}
 
 	/// Maximum number of simultaneous requests. Please note, the data will be processed in a single thread, so
 	/// don't overload much
-	pub fn get_segments_requests_limit(&self) -> usize {
-		Self::calc_mem_adequate_val2(
+	pub fn get_segments_requests_limit(&self, average_latency_ms: u32) -> usize {
+		let req_limit = Self::calc_mem_adequate_val2(
 			&SEGMENTS_REQUEST_LIMIT,
 			self.get_available_memory_mb(),
 			self.cpu_num,
+		);
+		cmp::max(
+			1,
+			(req_limit as f64 * self.get_network_speed_multiplier(average_latency_ms)).round()
+				as usize,
 		)
+	}
+
+	fn get_network_speed_multiplier(&self, average_latency_ms: u32) -> f64 {
+		if average_latency_ms == 0 || average_latency_ms == 30000 {
+			return 1.0;
+		}
+		if (Utc::now() - self.network_speed.read().last_network_speed_update).num_seconds() > 5 {
+			let mut network_speed = self.network_speed.write();
+			network_speed.last_network_speed_update = Utc::now();
+			let expected_latency_ms = PIBD_REQUESTS_TIMEOUT_SECS as u32 / 2 * 1000;
+			if average_latency_ms < expected_latency_ms {
+				let update_mul =
+					(expected_latency_ms - average_latency_ms) as f64 / expected_latency_ms as f64;
+				debug_assert!(update_mul >= 0.0 && update_mul <= 1.0);
+				network_speed.network_speed_multiplier =
+					1.0f64.min((network_speed.network_speed_multiplier) * (1.0 + 0.1 * update_mul));
+			} else {
+				let update_mul =
+					(average_latency_ms - expected_latency_ms) as f64 / expected_latency_ms as f64;
+				let update_mul = 1.0f64.min(update_mul);
+				debug_assert!(update_mul >= 0.0 && update_mul <= 1.0);
+				network_speed.network_speed_multiplier = 0.05f64
+					.max((network_speed.network_speed_multiplier) / (1.0 + 0.15 * update_mul));
+			}
+			debug!(
+				"for current latency {} ms the new network speed multiplier is {}",
+				average_latency_ms, network_speed.network_speed_multiplier
+			);
+			network_speed.network_speed_multiplier
+		} else {
+			self.network_speed.read().network_speed_multiplier
+		}
 	}
 
 	fn get_available_memory_mb(&self) -> u64 {
@@ -241,17 +216,6 @@ impl PibdParams {
 			*sys_memory_info = SysMemoryInfo::update();
 		}
 		sys_memory_info.available_memory_mb
-	}
-
-	fn calc_mem_adequate_val(range: &Range<u8>, available_memory_mb: u64, num_cores: usize) -> u8 {
-		if available_memory_mb < 500 || num_cores <= 1 {
-			range.start
-		} else if available_memory_mb < 1000 || num_cores <= 2 {
-			cmp::min(range.start.saturating_add(1), range.end.saturating_sub(1))
-		} else {
-			debug_assert!(range.end - range.start <= 3); // it is not true, add more ifs for memory checking
-			cmp::min(range.start.saturating_add(2), range.end.saturating_sub(1))
-		}
 	}
 
 	fn calc_mem_adequate_val2<T: Clone>(

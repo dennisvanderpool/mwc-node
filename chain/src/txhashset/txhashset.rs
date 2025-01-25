@@ -454,8 +454,11 @@ impl TxHashSet {
 
 		Ok(TxHashSetRoots {
 			output_root: output_pmmr.root().map_err(|e| Error::InvalidRoot(e))?,
+			output_mmr_size: self.output_pmmr_h.size,
 			rproof_root: rproof_pmmr.root().map_err(|e| Error::InvalidRoot(e))?,
+			rproof_mmr_size: self.rproof_pmmr_h.size,
 			kernel_root: kernel_pmmr.root().map_err(|e| Error::InvalidRoot(e))?,
+			kernel_mmr_size: self.kernel_pmmr_h.size,
 		})
 	}
 
@@ -1301,11 +1304,21 @@ impl<'a> Extension<'a> {
 	/// Once the PIBD set is downloaded, we need to ensure that the respective leaf sets
 	/// match the bitmap (particularly in the case of outputs being spent after a PIBD catch-up)
 	pub fn update_leaf_sets(&mut self, bitmap: &Bitmap) -> Result<(), Error> {
-		let flipped = bitmap.flip(0u32..bitmap.maximum().unwrap() + 1);
-		for spent_pmmr_index in flipped.iter() {
-			let pos0 = pmmr::insertion_to_pmmr_index(spent_pmmr_index.into());
-			self.output_pmmr.remove_from_leaf_set(pos0);
-			self.rproof_pmmr.remove_from_leaf_set(pos0);
+		#[cfg(debug_assertions)]
+		{
+			// segmenst are expected to be pruned during download process. Let's validat is it s prue.
+			let flipped = bitmap.flip(0u32..bitmap.maximum().unwrap() + 1);
+			for spent_pmmr_index in flipped.iter() {
+				let pos0 = pmmr::insertion_to_pmmr_index(spent_pmmr_index.into());
+				// Note, remove_from_leaf_set can;t be used, because the root will be affected
+				// Some segments might not be pruned, it is very expected.
+				assert!(self.output_pmmr.get_data(pos0).is_none());
+				assert!(self.rproof_pmmr.get_data(pos0).is_none());
+			}
+		}
+		#[cfg(not(debug_assertions))]
+		{
+			let _ = bitmap;
 		}
 		Ok(())
 	}
@@ -1323,6 +1336,7 @@ impl<'a> Extension<'a> {
 	) -> Result<(), Error> {
 		for segm in segments {
 			let (_sid, hash_pos, hashes, leaf_pos, leaf_data, _proof) = segm.parts();
+			let leaf_pos_copy = leaf_pos.clone();
 
 			// insert either leaves or pruned subtrees as we go
 			for insert in sort_pmmr_hashes_and_leaves(hash_pos, leaf_pos, Some(0)) {
@@ -1347,17 +1361,24 @@ impl<'a> Extension<'a> {
 								.push(&leaf_data[idx])
 								.map_err(&Error::TxHashSetErr)?;
 						}
-						let pmmr_index = pmmr::pmmr_leaf_to_insertion_index(pos0);
-						match pmmr_index {
-							Some(i) => {
-								if !bitmap.contains(i as u32) {
-									self.output_pmmr.remove_from_leaf_set(pos0);
-								}
-							}
-							None => {}
-						};
+						// Note, extra unproned segments will be upadted later
+						// Prone will be due
 					}
 				}
+			}
+			// Pruning elements that wasn't in the bitmap. It is expected that some data might not be pruned
+			// Note: we need to insert all data first and prune after. Also, there is no rpone at the end of PIBD download
+			for pos0 in leaf_pos_copy {
+				let pmmr_index = pmmr::pmmr_leaf_to_insertion_index(pos0);
+				match pmmr_index {
+					Some(i) => {
+						if !bitmap.contains(i as u32) {
+							let res = self.output_pmmr.prune(pos0);
+							debug_assert!(res.is_ok());
+						}
+					}
+					None => {}
+				};
 			}
 		}
 		Ok(())
@@ -1373,6 +1394,9 @@ impl<'a> Extension<'a> {
 	) -> Result<(), Error> {
 		for segm in segments {
 			let (_sid, hash_pos, hashes, leaf_pos, leaf_data, _proof) = segm.parts();
+			let leaf_pos_copy = leaf_pos.clone();
+
+			//info!("Adding proof segment {}, from mmr pos: {}  hashes sz: {}  leaf_data sz: {}  hash_pos: {:?}  hashes: {:?}   leaf_pos: {:?}  leaf_data: {:?}", sid.idx, self.rproof_pmmr.size, hashes.len(), leaf_data.len(), hash_pos, hashes, leaf_pos, leaf_data );
 
 			// insert either leaves or pruned subtrees as we go
 			for insert in sort_pmmr_hashes_and_leaves(hash_pos, leaf_pos, Some(0)) {
@@ -1397,17 +1421,25 @@ impl<'a> Extension<'a> {
 								.push(&leaf_data[idx])
 								.map_err(&Error::TxHashSetErr)?;
 						}
-						let pmmr_index = pmmr::pmmr_leaf_to_insertion_index(pos0);
-						match pmmr_index {
-							Some(i) => {
-								if !bitmap.contains(i as u32) {
-									self.rproof_pmmr.remove_from_leaf_set(pos0);
-								}
-							}
-							None => {}
-						};
+						// Note, extra unproned segments will be upadted later
+						// Prone will be due
 					}
 				}
+			}
+
+			// Pruning elements that wasn't in the bitmap. It is expecte dthat some data might not be pruned
+			// Note: we need to insert all data first and prune after. Also, there is no rpone at the end of PIBD download
+			for pos0 in leaf_pos_copy {
+				let pmmr_index = pmmr::pmmr_leaf_to_insertion_index(pos0);
+				match pmmr_index {
+					Some(i) => {
+						if !bitmap.contains(i as u32) {
+							let res = self.rproof_pmmr.prune(pos0);
+							debug_assert!(res.is_ok());
+						}
+					}
+					None => {}
+				};
 			}
 		}
 		Ok(())
@@ -1515,7 +1547,12 @@ impl<'a> Extension<'a> {
 	/// Rewinds the MMRs to the provided block, rewinding to the last output pos
 	/// and last kernel pos of that block. If `updated_bitmap` is supplied, the
 	/// bitmap accumulator will be replaced with its contents
-	pub fn rewind(&mut self, header: &BlockHeader, batch: &Batch<'_>) -> Result<(), Error> {
+	pub fn rewind(
+		&mut self,
+		header: &BlockHeader,
+		batch: &Batch<'_>,
+		header_ext: &HeaderExtension<'_>,
+	) -> Result<(), Error> {
 		debug!(
 			"Rewind extension to {} at {} from {} at {}",
 			header.hash(),
@@ -1539,7 +1576,7 @@ impl<'a> Extension<'a> {
 			let mut current = head_header;
 			while header.height < current.height {
 				let block = batch.get_block(&current.hash())?;
-				self.rewind_single_block(&block, batch)?;
+				self.rewind_single_block(&block, batch, header_ext)?;
 				current = batch.get_previous_header(&current)?;
 			}
 		}
@@ -1553,7 +1590,12 @@ impl<'a> Extension<'a> {
 	// Rewind the MMRs and the output_pos index.
 	// Returns a vec of "affected_pos" so we can apply the necessary updates to the bitmap
 	// accumulator in a single pass for all rewound blocks.
-	fn rewind_single_block(&mut self, block: &Block, batch: &Batch<'_>) -> Result<(), Error> {
+	fn rewind_single_block(
+		&mut self,
+		block: &Block,
+		batch: &Batch<'_>,
+		header_ext: &HeaderExtension<'_>,
+	) -> Result<(), Error> {
 		let header = &block.header;
 		let prev_header = batch.get_previous_header(&header)?;
 
@@ -1568,8 +1610,19 @@ impl<'a> Extension<'a> {
 				header.hash(),
 				header.height
 			);
-			let bitmap = batch.get_block_input_bitmap(&header.hash())?;
-			bitmap.iter().map(|x| x.into()).collect()
+			if let Ok(bitmap) = batch.get_block_input_bitmap(&header.hash()) {
+				bitmap.iter().map(|x| x.into()).collect()
+			} else {
+				warn!(
+					"rewind_single_block: fallback to calculating spent inputs for block {} at {}",
+					header.hash(),
+					header.height
+				);
+				let spent = self
+					.utxo_view(header_ext)
+					.validate_inputs(&block.inputs(), batch)?;
+				spent.into_iter().map(|(_, pos)| pos.pos).collect()
+			}
 		};
 
 		if header.height == 0 {
@@ -1647,8 +1700,11 @@ impl<'a> Extension<'a> {
 	pub fn roots(&self) -> Result<TxHashSetRoots, Error> {
 		Ok(TxHashSetRoots {
 			output_root: self.output_pmmr.root().map_err(|e| Error::InvalidRoot(e))?,
+			output_mmr_size: self.output_pmmr.size,
 			rproof_root: self.rproof_pmmr.root().map_err(|e| Error::InvalidRoot(e))?,
+			rproof_mmr_size: self.rproof_pmmr.size,
 			kernel_root: self.kernel_pmmr.root().map_err(|e| Error::InvalidRoot(e))?,
+			kernel_mmr_size: self.kernel_pmmr.size,
 		})
 	}
 

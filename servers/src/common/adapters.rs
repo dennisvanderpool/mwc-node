@@ -19,7 +19,6 @@
 use crate::util::RwLock;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
-use std::thread;
 use std::time::Instant;
 
 use crate::chain::txhashset::BitmapChunk;
@@ -36,6 +35,7 @@ use crate::core::core::{
 use crate::core::pow::Difficulty;
 use crate::core::ser::ProtocolVersion;
 use crate::core::{core, global};
+use crate::mwc::sync::get_locator_heights;
 use crate::mwc::sync::sync_manager::SyncManager;
 use crate::p2p;
 use crate::p2p::types::PeerInfo;
@@ -44,11 +44,9 @@ use crate::util::secp::pedersen::RangeProof;
 use crate::util::OneTime;
 use chrono::prelude::*;
 use chrono::Duration;
-use mwc_chain::pibd_params;
 use mwc_chain::txhashset::Segmenter;
 use mwc_p2p::PeerAddr;
 use mwc_util::secp::{ContextFlag, Secp256k1};
-use rand::prelude::*;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 
@@ -100,7 +98,7 @@ where
 	P: PoolAdapter,
 {
 	sync_state: Arc<SyncState>,
-	sync_manager: Arc<RwLock<SyncManager>>,
+	sync_manager: Arc<SyncManager>,
 	chain: Weak<chain::Chain>,
 	tx_pool: Arc<RwLock<pool::TransactionPool<B, P>>>,
 	peers: OneTime<Weak<p2p::Peers>>,
@@ -363,7 +361,8 @@ where
 			debug!("header_received, cache for {} OK", bh_hash);
 		}
 
-		if self.chain().block_exists(&bh.hash())? {
+		let chain = self.chain();
+		if chain.block_exists(&bh.hash())? {
 			return Ok(true);
 		}
 		if !self.sync_state.is_syncing() {
@@ -374,15 +373,37 @@ where
 
 		// pushing the new block header through the header chain pipeline
 		// we will go ask for the block if this is a new header
-		let res = self.chain().process_block_header(&bh, chain::Options::NONE);
+		let res = chain.process_block_header(&bh, chain::Options::NONE);
 
 		if let Err(e) = res {
 			debug!("Block header {} refused by chain: {:?}", bh.hash(), e);
 			if e.is_bad_data() {
 				return Ok(false);
 			} else {
-				// we got an error when trying to process the block header
-				// but nothing serious enough to need to ban the peer upstream
+				if self.sync_state.are_headers_done() {
+					// we got an error when trying to process the block header
+					// but nothing serious enough to need to ban the peer upstream
+					// Probably child block doesn't exist, let's request them
+					if let Some(peer) = self.peers().get_connected_peer(&peer_info.addr) {
+						let head = chain.head()?;
+						debug!(
+							"Got unknown header, requesting headers from the peer {} at height {}",
+							peer_info.addr, head.height
+						);
+						let heights = get_locator_heights(head.height);
+						let locator = chain.get_locator_hashes(head, &heights)?;
+						let _ = peer.send_header_request(locator);
+
+						if let Ok(tip) = chain.head() {
+							// Requesting of orphans buffer is large enough to finish the job with request
+							if bh.height.saturating_sub(tip.height)
+								< chain.get_pibd_params().get_orphans_num_limit() as u64
+							{
+								let _ = peer.send_block_request(bh.hash(), chain::Options::NONE);
+							}
+						}
+					}
+				}
 				return Err(e);
 			}
 		}
@@ -412,7 +433,6 @@ where
 		}
 
 		self.sync_manager
-			.write()
 			.receive_headers(&peer_info.addr, bhs, remaining, self.peers());
 		Ok(())
 	}
@@ -474,9 +494,6 @@ where
 		hash: Hash,
 		id: SegmentIdentifier,
 	) -> Result<Segment<TxKernel>, chain::Error> {
-		if !pibd_params::KERNEL_SEGMENT_HEIGHT_RANGE.contains(&id.height) {
-			return Err(chain::Error::InvalidSegmentHeight);
-		}
 		if self.sync_state.is_syncing() {
 			return Err(chain::Error::ChainInSync);
 		}
@@ -496,9 +513,6 @@ where
 		hash: Hash,
 		id: SegmentIdentifier,
 	) -> Result<Segment<BitmapChunk>, chain::Error> {
-		if !pibd_params::BITMAP_SEGMENT_HEIGHT_RANGE.contains(&id.height) {
-			return Err(chain::Error::InvalidSegmentHeight);
-		}
 		if self.sync_state.is_syncing() {
 			return Err(chain::Error::ChainInSync);
 		}
@@ -518,9 +532,6 @@ where
 		hash: Hash,
 		id: SegmentIdentifier,
 	) -> Result<Segment<OutputIdentifier>, chain::Error> {
-		if !pibd_params::OUTPUT_SEGMENT_HEIGHT_RANGE.contains(&id.height) {
-			return Err(chain::Error::InvalidSegmentHeight);
-		}
 		if self.sync_state.is_syncing() {
 			return Err(chain::Error::ChainInSync);
 		}
@@ -540,9 +551,6 @@ where
 		hash: Hash,
 		id: SegmentIdentifier,
 	) -> Result<Segment<RangeProof>, chain::Error> {
-		if !pibd_params::RANGEPROOF_SEGMENT_HEIGHT_RANGE.contains(&id.height) {
-			return Err(chain::Error::InvalidSegmentHeight);
-		}
 		if self.sync_state.is_syncing() {
 			return Err(chain::Error::ChainInSync);
 		}
@@ -568,12 +576,8 @@ where
 			"Received PIBD handshake response from {}. Header {} at {}, root_hash {}",
 			peer, header_hash, header_height, output_bitmap_root
 		);
-		self.sync_manager.write().recieve_pibd_status(
-			peer,
-			header_hash,
-			header_height,
-			output_bitmap_root,
-		);
+		self.sync_manager
+			.recieve_pibd_status(peer, header_hash, header_height, output_bitmap_root);
 		Ok(())
 	}
 
@@ -588,7 +592,6 @@ where
 			peer, header_hash, header_height
 		);
 		self.sync_manager
-			.write()
 			.recieve_another_archive_header(peer, header_hash, header_height);
 		Ok(())
 	}
@@ -603,11 +606,8 @@ where
 			"Received headers hash response {}, {} from {}",
 			archive_height, headers_hash_root, peer
 		);
-		self.sync_manager.write().receive_headers_hash_response(
-			peer,
-			archive_height,
-			headers_hash_root,
-		);
+		self.sync_manager
+			.receive_headers_hash_response(peer, archive_height, headers_hash_root);
 		Ok(())
 	}
 
@@ -616,9 +616,6 @@ where
 		header_hashes_root: Hash,
 		id: SegmentIdentifier,
 	) -> Result<Segment<Hash>, chain::Error> {
-		if !pibd_params::HEADERS_HASHES_SEGMENT_HEIGHT_RANGE.contains(&id.height) {
-			return Err(chain::Error::InvalidSegmentHeight);
-		}
 		if self.sync_state.is_syncing() {
 			return Err(chain::Error::ChainInSync);
 		}
@@ -647,7 +644,6 @@ where
 			peer
 		);
 		self.sync_manager
-			.write()
 			.receive_header_hashes_segment(peer, header_hashes_root, segment);
 		Ok(())
 	}
@@ -659,12 +655,13 @@ where
 		segment: Segment<BitmapChunk>,
 	) -> Result<(), chain::Error> {
 		info!(
-			"Received bitmap segment {} for block_hash: {}",
-			segment.identifier().idx,
-			archive_header_hash
+			"Received bitmap segment {} for block_hash: {} from {}",
+			segment.identifier(),
+			archive_header_hash,
+			peer
 		);
 
-		self.sync_manager.write().receive_bitmap_segment(
+		self.sync_manager.receive_bitmap_segment(
 			peer,
 			&archive_header_hash,
 			segment,
@@ -680,12 +677,13 @@ where
 		segment: Segment<OutputIdentifier>,
 	) -> Result<(), chain::Error> {
 		info!(
-			"Received output segment {} for block_hash: {}",
-			segment.identifier().idx,
+			"Received output segment {} for block_hash: {} from {}",
+			segment.identifier(),
 			archive_header_hash,
+			peer,
 		);
 
-		self.sync_manager.write().receive_output_segment(
+		self.sync_manager.receive_output_segment(
 			peer,
 			&archive_header_hash,
 			segment,
@@ -701,12 +699,13 @@ where
 		segment: Segment<RangeProof>,
 	) -> Result<(), chain::Error> {
 		info!(
-			"Received proof segment {} for block_hash: {}",
-			segment.identifier().idx,
-			archive_header_hash
+			"Received proof segment {} for block_hash: {}  from {}",
+			segment.identifier(),
+			archive_header_hash,
+			peer
 		);
 
-		self.sync_manager.write().receive_rangeproof_segment(
+		self.sync_manager.receive_rangeproof_segment(
 			peer,
 			&archive_header_hash,
 			segment,
@@ -722,12 +721,13 @@ where
 		segment: Segment<TxKernel>,
 	) -> Result<(), chain::Error> {
 		info!(
-			"Received kernel segment {} for block_hash: {}",
-			segment.identifier().idx,
-			archive_header_hash
+			"Received kernel segment {} for block_hash: {} from {}",
+			segment.identifier(),
+			archive_header_hash,
+			peer
 		);
 
-		self.sync_manager.write().receive_kernel_segment(
+		self.sync_manager.receive_kernel_segment(
 			peer,
 			&archive_header_hash,
 			segment,
@@ -746,7 +746,7 @@ where
 	pub fn new(
 		sync_state: Arc<SyncState>,
 		chain: Arc<chain::Chain>,
-		sync_manager: Arc<RwLock<SyncManager>>,
+		sync_manager: Arc<SyncManager>,
 		tx_pool: Arc<RwLock<pool::TransactionPool<B, P>>>,
 		config: ServerConfig,
 		hooks: Vec<Box<dyn NetEvents + Send + Sync>>,
@@ -793,68 +793,81 @@ where
 		opts: chain::Options,
 	) -> Result<bool, chain::Error> {
 		// We cannot process blocks earlier than the horizon so check for this here.
-		{
-			let head = self.chain().head()?;
+		let chain = self.chain();
+		let head = {
+			let head = chain.head()?;
 			let horizon = head
 				.height
 				.saturating_sub(global::cut_through_horizon() as u64);
 			if b.header.height < horizon {
+				debug!("Got block is below horizon from peer {}", peer_info.addr);
 				return Ok(true);
 			}
-		}
+			head
+		};
 
 		let bhash = b.hash();
-		let previous = self.chain().get_previous_header(&b.header);
-
-		match self.chain().process_block(b, opts) {
+		match chain.process_block(b.clone(), opts) {
 			Ok(_) => {
 				self.validate_chain(&bhash);
-				self.check_compact();
-				self.sync_manager.write().recieve_block_reporting(
+				//self.check_compact();  Currently Sync process does that. No needs, also we don't want collosion to happens
+				self.sync_manager.recieve_block_reporting(
 					true,
 					&peer_info.addr,
-					&bhash,
+					b,
+					opts,
 					&self.peers(),
 				);
 				Ok(true)
 			}
 			Err(ref e) if e.is_bad_data() => {
+				warn!("process_block: block {} from peer {} is bad. Block is rejected, peer is banned. Error: {}", bhash, peer_info.addr, e);
 				self.validate_chain(&bhash);
-				self.sync_manager.write().recieve_block_reporting(
+				self.sync_manager.recieve_block_reporting(
 					false,
 					&peer_info.addr,
-					&bhash,
+					b,
+					opts,
 					&self.peers(),
 				);
 				Ok(false)
 			}
 			Err(e) => {
+				let prev_block_hash = b.header.prev_hash.clone();
+				let previous = chain.get_previous_header(&b.header);
+				let need_request_prev_block = self.sync_manager.recieve_block_reporting(
+					!e.is_bad_data(),
+					&peer_info.addr,
+					b,
+					opts,
+					&self.peers(),
+				);
 				match e {
-					chain::Error::Orphan(orph_msg) => {
-						self.sync_manager.write().recieve_block_reporting(
-							true,
-							&peer_info.addr,
-							&bhash,
-							&self.peers(),
-						);
-						if let Ok(previous) = previous {
-							// make sure we did not miss the parent block
-							if !self.chain().is_orphan(&previous.hash())
-								&& !self.sync_state.is_syncing()
-							{
-								debug!("process_block: received an orphan block: {}, checking the parent: {:}", orph_msg, previous.hash());
-								self.request_block(&previous, peer_info, chain::Options::NONE)
+					chain::Error::StoreErr(_, _) | chain::Error::Orphan(_) => {
+						if previous.is_err() {
+							// requesting headers from that peer
+							if let Some(peer) = self.peers().get_connected_peer(&peer_info.addr) {
+								debug!("Got block with unknow headers, requesting headers from the peer {} at height {}", peer_info.addr, head.height);
+								let heights = get_locator_heights(head.height);
+								let locator = chain.get_locator_hashes(head, &heights)?;
+								let _ = peer.send_header_request(locator);
+							}
+						}
+						if need_request_prev_block {
+							// requesting headers from that peer
+							if let Some(peer) = self.peers().get_connected_peer(&peer_info.addr) {
+								// requesting prev block from that peer
+								debug!("Got block with unknow child, requesting prev block {} from the peer {}", prev_block_hash, peer_info.addr);
+								let _ =
+									peer.send_block_request(prev_block_hash, chain::Options::NONE);
 							}
 						}
 						Ok(true)
 					}
 					_ => {
-						debug!("process_block: block {} refused by chain: {}", bhash, e);
-						self.sync_manager.write().recieve_block_reporting(
-							false,
-							&peer_info.addr,
-							&bhash,
-							&self.peers(),
+						info!(
+							"process_block: block {} from peer {} refused by chain: {}",
+							bhash, peer_info.addr, e
 						);
 						Ok(true)
 					}
@@ -891,6 +904,7 @@ where
 		}
 	}
 
+	/*	Compact is dome form the sync thread now. Also another thread will not help much because of batch blocking
 	fn check_compact(&self) {
 		// Roll the dice to trigger compaction at 1/COMPACTION_CHECK chance per block,
 		// uses a different thread to avoid blocking the caller thread (likely a peer)
@@ -905,7 +919,7 @@ where
 					}
 				});
 		}
-	}
+	}*/
 
 	fn request_transaction(&self, h: Hash, peer_info: &PeerInfo) {
 		self.send_tx_request_to_peer(h, peer_info, |peer, h| peer.send_tx_request(h))
@@ -1245,6 +1259,7 @@ impl pool::BlockChain for PoolToChainAdapter {
 #[cfg(test)]
 mod test {
 	use super::*;
+	use std::thread;
 	use std::time::Duration;
 
 	#[test]

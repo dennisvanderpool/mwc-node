@@ -1,4 +1,3 @@
-// Copyright 2019 The Grin Developers
 // Copyright 2024 The MWC Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,17 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Syncing of the chain with the rest of the network
+use std::collections::HashMap;
 
-mod body_sync;
-mod header_hashes_sync;
-mod header_sync;
-mod orphans_sync;
-mod state_sync;
-pub mod sync_manager;
-mod sync_peers;
-mod sync_utils;
-mod syncer;
-pub use header_sync::get_locator_heights;
+/// Lookup for registered (requests)
+pub trait RequestLookup<K> {
+	/// return true if request is already registered
+	fn contains_request(&self, key: &K) -> bool;
+}
 
-pub use self::syncer::run_sync;
+impl<'a, K, V> RequestLookup<K> for &'a HashMap<K, V>
+where
+	K: std::cmp::Eq + std::hash::Hash,
+{
+	fn contains_request(&self, key: &K) -> bool {
+		self.contains_key(key)
+	}
+}

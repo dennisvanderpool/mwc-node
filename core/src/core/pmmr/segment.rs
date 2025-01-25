@@ -16,7 +16,7 @@
 //! Segment of a PMMR.
 
 use crate::core::hash::Hash;
-use crate::core::pmmr::{self, Backend, ReadablePMMR, ReadonlyPMMR};
+use crate::core::pmmr::{self, Backend, ReadablePMMR, ReadonlyPMMR, VecBackend, PMMR};
 use crate::ser::{Error, PMMRIndexHashable, PMMRable, Readable, Reader, Writeable, Writer};
 use croaring::Bitmap;
 use std::cmp::min;
@@ -71,6 +71,9 @@ pub enum SegmentError {
 	/// Mismatch between expected and actual root hash
 	#[error("Root hash mismatch")]
 	Mismatch,
+	/// Too large segment size
+	#[error("Segment is too large")]
+	SegmentSizeAboveLimit,
 }
 
 /// Tuple that defines a segment of a given PMMR
@@ -84,7 +87,14 @@ pub struct SegmentIdentifier {
 
 impl Display for SegmentIdentifier {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "(h:{}, idx:{})", self.height, self.idx)
+		write!(
+			f,
+			"(h:{}, idx:{} offset:{} size:{})",
+			self.height,
+			self.idx,
+			self.leaf_offset(),
+			self.segment_capacity()
+		)
 	}
 }
 
@@ -104,39 +114,23 @@ impl Writeable for SegmentIdentifier {
 }
 
 impl SegmentIdentifier {
-	/// Test helper to get an iterator of SegmentIdentifiers required to read a
-	/// pmmr of size `target_mmr_size` in segments of height `segment_height`
-	pub fn traversal_iter(
-		target_mmr_size: u64,
-		segment_height: u8,
-	) -> impl Iterator<Item = SegmentIdentifier> {
-		(0..SegmentIdentifier::count_segments_required(target_mmr_size, segment_height)).map(
-			move |idx| SegmentIdentifier {
-				height: segment_height,
-				idx: idx as u64,
-			},
-		)
+	/// Create a new segment
+	pub fn new(height: u8, idx: u64) -> Self {
+		SegmentIdentifier { height, idx }
 	}
 
-	/// Returns number of segments required that would needed in order to read a
-	/// pmmr of size `target_mmr_size` in segments of height `segment_height`
-	pub fn count_segments_required(target_mmr_size: u64, segment_height: u8) -> u64 {
-		let d = 1 << segment_height;
-		(pmmr::n_leaves(target_mmr_size) + d - 1) / d
-	}
-
-	/// Return pmmr size of number of segments of the given height
-	pub fn pmmr_size(num_segments: usize, height: u8) -> u64 {
-		pmmr::insertion_to_pmmr_index(num_segments as u64 * (1 << height))
+	/// Maximum number of leaves in a segment, given by `2**height`
+	pub fn segment_capacity_ex(height: u8) -> u64 {
+		1 << height
 	}
 
 	/// Maximum number of leaves in a segment, given by `2**height`
 	pub fn segment_capacity(&self) -> u64 {
-		1 << self.height
+		Self::segment_capacity_ex(self.height)
 	}
 
 	/// Offset (in leaf idx) of first leaf in the segment
-	fn leaf_offset(&self) -> u64 {
+	pub fn leaf_offset(&self) -> u64 {
 		self.idx * self.segment_capacity()
 	}
 
@@ -199,8 +193,13 @@ impl<T> Segment<T> {
 	}
 
 	/// Offset (in leaf idx) of first leaf in the segment
-	fn _leaf_offset(&self) -> u64 {
+	pub fn leaf_offset(&self) -> u64 {
 		self.identifier.leaf_offset()
+	}
+
+	/// Check if it is not pruned segment (segment with leaves only, no hashes)
+	pub fn is_no_prune(&self) -> bool {
+		self.hashes.is_empty()
 	}
 
 	// Number of leaves in this segment. Equal to capacity except for the final segment, which can be smaller
@@ -229,8 +228,8 @@ impl<T> Segment<T> {
 	}
 
 	/// Get the identifier associated with this segment
-	pub fn identifier(&self) -> SegmentIdentifier {
-		self.identifier
+	pub fn identifier(&self) -> &SegmentIdentifier {
+		&self.identifier
 	}
 
 	/// Consume the segment and return its parts
@@ -312,16 +311,18 @@ impl<T> Segment<T> {
 
 impl<T> Segment<T>
 where
-	T: Readable + Writeable + Debug,
+	T: Readable + Writeable + Debug + PMMRable<E = T> + Sync,
 {
 	/// Generate a segment from a PMMR
 	pub fn from_pmmr<U, B>(
 		segment_id: SegmentIdentifier,
 		pmmr: &ReadonlyPMMR<'_, U, B>,
-		prunable: bool,
+		bitmap: Option<&Bitmap>,
+		leaf_size: usize,
+		segment_size_limit: usize,
 	) -> Result<Self, SegmentError>
 	where
-		U: PMMRable<E = T>,
+		U: PMMRable<E = T> + Sync,
 		B: Backend<U>,
 	{
 		let mut segment = Segment::empty(segment_id);
@@ -331,23 +332,97 @@ where
 			return Err(SegmentError::NonExistent);
 		}
 
-		// Fill leaf data and hashes
 		let (segment_first_pos, segment_last_pos) = segment.segment_pos_range(mmr_size);
-		for pos0 in segment_first_pos..=segment_last_pos {
-			if pmmr::is_leaf(pos0) {
-				if let Some(data) = pmmr.get_data_from_file(pos0) {
-					segment.leaf_data.push(data);
-					segment.leaf_pos.push(pos0);
-					continue;
-				} else if !prunable {
-					return Err(SegmentError::MissingLeaf(pos0));
+
+		if let Some(bitmap) = bitmap {
+			// let's try to build the segment and prune it...
+			let mut segm_copy_data: VecBackend<T> = VecBackend::new();
+			let mut segm_copy = PMMR::new(&mut segm_copy_data);
+			segm_copy.update_index_offset(segment_first_pos);
+
+			// constructin the segment in the memory.
+			let mut prune_pos = Vec::new();
+			for pos0 in segment_first_pos..=segment_last_pos {
+				if pmmr::is_leaf(pos0) {
+					if let Some(data) = pmmr.get_data_from_file(pos0) {
+						segm_copy.push(&data).expect("Push into local MMR");
+
+						let idx_1 = pmmr::n_leaves(pos0 + 1) - 1;
+						let idx_2 = if pmmr::is_left_sibling(pos0) {
+							idx_1 + 1
+						} else {
+							idx_1 - 1
+						};
+
+						let keeping = bitmap.contains(idx_1 as u32)
+							|| bitmap.contains(idx_2 as u32)
+							|| pos0 == mmr_size - 1;
+						if !keeping {
+							prune_pos.push(pos0);
+						}
+						continue;
+					}
+				}
+				if let Some(hash) = pmmr.get_from_file(pos0) {
+					let pos0_copy = pos0 - segment_first_pos;
+					if pos0_copy >= segm_copy.size {
+						segm_copy.push_pruned_subtree(hash, pos0_copy).unwrap();
+					}
 				}
 			}
-			// TODO: optimize, no need to send every intermediary hash
-			if prunable {
-				if let Some(hash) = pmmr.get_from_file(pos0) {
+
+			// Pruning elements that wasn't in the bitmap. It is expected that some data might not be pruned
+			// Note: we need to insert all data first and prune after. Also, there is no prpone at the end of PIBD download
+			for ps in prune_pos {
+				let res = segm_copy
+					.prune(ps - segment_first_pos)
+					.expect("PMMR must have it");
+				debug_assert!(res);
+			}
+
+			let copy_size = segm_copy.unpruned_size();
+
+			segm_copy_data.compact(true);
+
+			let mut segm_copy = PMMR::at(&mut segm_copy_data, copy_size);
+			segm_copy.update_index_offset(segment_first_pos);
+
+			// Now we can retry to build the segment from this local copy of PMMR
+			let mut segment_size = 0;
+			for pos0 in 0..=segm_copy.unpruned_size() {
+				if segment_size > segment_size_limit {
+					return Err(SegmentError::SegmentSizeAboveLimit);
+				}
+				if pmmr::is_leaf(pos0) {
+					if let Some(data) = segm_copy.get_data(pos0) {
+						segment.leaf_data.push(data);
+						segment.leaf_pos.push(pos0 + segment_first_pos);
+						segment_size += 8 + leaf_size;
+						continue;
+					}
+				}
+				if let Some(hash) = segm_copy.get_from_file(pos0) {
 					segment.hashes.push(hash);
-					segment.hash_pos.push(pos0);
+					segment.hash_pos.push(pos0 + segment_first_pos);
+					segment_size += 8 + 32;
+				}
+			}
+		} else {
+			// Not prunable scenario
+			let mut segment_size = 0;
+			for pos0 in segment_first_pos..=segment_last_pos {
+				if segment_size > segment_size_limit {
+					return Err(SegmentError::SegmentSizeAboveLimit);
+				}
+				if pmmr::is_leaf(pos0) {
+					if let Some(data) = pmmr.get_data_from_file(pos0) {
+						segment.leaf_data.push(data);
+						segment.leaf_pos.push(pos0);
+						segment_size += 8 + leaf_size;
+						continue;
+					} else {
+						return Err(SegmentError::MissingLeaf(pos0));
+					}
 				}
 			}
 		}
@@ -384,7 +459,7 @@ where
 	T: PMMRIndexHashable,
 {
 	/// Calculate root hash of this segment
-	/// Returns `None` iff the segment is full and completely pruned
+	/// Returns `None` if the segment is full and completely pruned
 	pub fn root(
 		&self,
 		mmr_size: u64,

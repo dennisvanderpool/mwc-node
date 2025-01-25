@@ -20,14 +20,16 @@ use crate::core::core::pmmr;
 use crate::core::core::{BlockHeader, Segment};
 use crate::error::Error;
 use crate::pibd_params::PibdParams;
+use crate::txhashset::request_lookup::RequestLookup;
 use crate::txhashset::segments_cache::SegmentsCache;
-use crate::txhashset::{sort_pmmr_hashes_and_leaves, OrderedHashLeafNode};
+use crate::txhashset::{sort_pmmr_hashes_and_leaves, Desegmenter, OrderedHashLeafNode};
 use crate::types::HEADERS_PER_BATCH;
-use crate::Options;
+use crate::{pibd_params, Options};
 use mwc_core::core::pmmr::{VecBackend, PMMR};
 use mwc_core::core::{SegmentIdentifier, SegmentType};
+use mwc_util::RwLock;
 use std::cmp;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// There is no reasons to introduce a special type, for that. For place maker any type will work
@@ -53,11 +55,14 @@ impl HeaderHashesDesegmenter {
 		headers_root_hash: Hash, // target height and headers_root_hash must be get as a result of handshake process.
 		pibd_params: Arc<PibdParams>,
 	) -> Self {
-		let size = 1u64 << pibd_params.get_headers_segment_height();
 		let n_leaves = target_height / HEADERS_PER_BATCH as u64 + 1;
-		let need_segments = (n_leaves + size - 1) / size;
-
 		let header_pmmr_size = pmmr::insertion_to_pmmr_index(n_leaves);
+		let header_segments = Desegmenter::generate_segments(
+			Hash::LEN,
+			pibd_params::PIBD_MESSAGE_SIZE_LIMIT,
+			header_pmmr_size,
+			None,
+		);
 
 		HeaderHashesDesegmenter {
 			genesis_hash,
@@ -65,19 +70,19 @@ impl HeaderHashesDesegmenter {
 			target_height,
 			headers_root_hash,
 			header_pmmr_size,
-			header_segment_cache: SegmentsCache::new(HEADER_HASHES_STUB_TYPE, need_segments),
+			header_segment_cache: SegmentsCache::new(HEADER_HASHES_STUB_TYPE, header_segments),
 			pibd_params,
 		}
 	}
 
 	/// Get number of completed segments
-	pub fn get_segments_completed(&self) -> u64 {
+	pub fn get_segments_completed(&self) -> usize {
 		self.header_segment_cache.get_received_segments()
 	}
 
 	/// Get number of total segments
-	pub fn get_segments_total(&self) -> u64 {
-		self.header_segment_cache.get_required_segments()
+	pub fn get_segments_total(&self) -> usize {
+		self.header_segment_cache.get_required_segments_num()
 	}
 
 	/// Reset all state
@@ -102,18 +107,19 @@ impl HeaderHashesDesegmenter {
 
 	/// Return list of the next preferred segments the desegmenter needs based on
 	/// the current real state of the underlying elements
-	pub fn next_desired_segments<T>(
+	pub fn next_desired_segments(
 		&mut self,
 		max_elements: usize,
-		requested_segments: &HashMap<(SegmentType, u64), T>,
-		pibd_params: &PibdParams,
+		requested_segments: &dyn RequestLookup<(SegmentType, u64)>,
 	) -> Vec<SegmentIdentifier> {
-		self.header_segment_cache.next_desired_segments(
-			pibd_params.get_headers_segment_height(),
-			max_elements,
-			requested_segments,
-			self.pibd_params.get_headers_hash_buffer_len(),
-		)
+		// For headers hashes there is no duplicate requests. There are not much data...
+		self.header_segment_cache
+			.next_desired_segments(
+				max_elements,
+				requested_segments,
+				self.pibd_params.get_headers_hash_buffer_len(),
+			)
+			.0
 	}
 
 	/// Adds a output segment
@@ -126,14 +132,14 @@ impl HeaderHashesDesegmenter {
 			return Err(Error::InvalidHeadersRoot);
 		}
 
-		if segment.identifier().height != self.pibd_params.get_headers_segment_height() {
-			return Err(Error::InvalidSegmentHeght);
+		if !self.header_segment_cache.has_segment(segment.identifier()) {
+			return Err(Error::InvalidSegmentId);
 		}
 
-		let segm_idx = segment.identifier().idx;
+		let leaf_offset = segment.identifier().leaf_offset();
 
 		// Checking if first hash matching genesis
-		if segm_idx == 0 {
+		if leaf_offset == 0 {
 			if let Some((_, first_hash)) = segment.leaf_iter().next() {
 				if *first_hash != self.genesis_hash {
 					return Err(Error::InvalidGenesisHash);
@@ -141,17 +147,20 @@ impl HeaderHashesDesegmenter {
 			}
 		}
 
-		if self.header_segment_cache.is_duplicate_segment(segm_idx) {
+		if self
+			.header_segment_cache
+			.is_duplicate_segment(segment.identifier())
+		{
 			info!(
-				"headers_desegmenter: skipping duplicated header segment with id {}",
-				segment.identifier().idx
+				"headers_desegmenter: skipping duplicated header segment {}",
+				leaf_offset,
 			);
 			return Ok(());
 		}
 
 		info!(
-			"headers_desegmenter: adding headers segment with id {}",
-			segment.identifier().idx
+			"headers_desegmenter: adding headers segment {}",
+			leaf_offset,
 		);
 		segment.validate(self.header_pmmr_size, None, &self.headers_root_hash)?;
 
@@ -159,7 +168,7 @@ impl HeaderHashesDesegmenter {
 		let header_pmmr = &mut self.header_pmmr;
 
 		// Let's apply the data
-		header_segment_cache.apply_new_segment(segment, |segments| {
+		header_segment_cache.apply_new_segment(segment, false, |segments| {
 			let size = header_pmmr.size();
 			let mut header_pmmr = PMMR::at(header_pmmr, size);
 
@@ -198,7 +207,7 @@ pub struct HeadersRecieveCache<T = String> {
 	// Archive header height used for the sync process
 	archive_header_height: u64,
 	// cahce with recievd headers
-	main_headers_cache: BTreeMap<u64, (Vec<BlockHeader>, T)>,
+	main_headers_cache: RwLock<BTreeMap<u64, (Vec<BlockHeader>, T)>>,
 	// target chain to feed the data
 	chain: Arc<crate::Chain>,
 }
@@ -211,7 +220,7 @@ impl<T> HeadersRecieveCache<T> {
 	) -> Self {
 		let mut res = HeadersRecieveCache {
 			archive_header_height: 0,
-			main_headers_cache: BTreeMap::new(),
+			main_headers_cache: RwLock::new(BTreeMap::new()),
 			chain: chain.clone(),
 		};
 		res.prepare_download_headers(header_desegmenter)
@@ -246,12 +255,14 @@ impl<T> HeadersRecieveCache<T> {
 					.unwrap()
 					.get(hash_idx as usize)
 				{
-					if header.hash() != *hash {
-						// need to check the first hash, if it doesn't match, let's reset all blockchain. Hashes are below horizon,
-						// if something not matching better to reset all the data, including block data and restart with headers download
-						self.chain.reset_chain_head(self.chain.genesis(), true)?;
-					} else {
-						break;
+					if let Some(hash) = hash {
+						if header.hash() != *hash {
+							// need to check the first hash, if it doesn't match, let's reset all blockchain. Hashes are below horizon,
+							// if something not matching better to reset all the data, including block data and restart with headers download
+							self.chain.reset_chain_head(self.chain.genesis(), true)?;
+						} else {
+							break;
+						}
 					}
 				}
 			}
@@ -261,7 +272,7 @@ impl<T> HeadersRecieveCache<T> {
 
 	/// Reset all state
 	pub fn reset(&mut self) {
-		self.main_headers_cache.clear();
+		self.main_headers_cache.write().clear();
 		self.archive_header_height = 0;
 	}
 
@@ -273,56 +284,103 @@ impl<T> HeadersRecieveCache<T> {
 	}
 
 	/// Return list of the next preferred segments the desegmenter needs based on
-	/// the current real state of the underlying elements
-	pub fn next_desired_headers<K>(
-		&mut self,
+	/// the current real state of the underlying elements. Second array - list of delayed requests. We better to retry them
+	/// 3rd array - all requesrs that are expected.
+	pub fn next_desired_headers(
+		&self,
 		headers: &HeaderHashesDesegmenter,
 		elements: usize,
-		requested_hashes: &HashMap<Hash, K>,
-	) -> Result<Vec<(Hash, u64)>, Error> {
+		request_tracker: &dyn RequestLookup<Hash>,
+		headers_cache_size_limit: usize,
+	) -> Result<(Vec<(Hash, u64)>, Vec<(Hash, u64)>, Vec<(Hash, u64)>), Error> {
 		let mut return_vec = vec![];
 		let tip = self.chain.header_head()?;
 		let base_hash_idx = tip.height / HEADERS_PER_BATCH as u64;
 		// Still limiting by 1000 because of memory. Cache is limited, we better wait if theer are so many behind...
 		let max_idx = cmp::min(
-			base_hash_idx + 1000,
+			base_hash_idx + headers_cache_size_limit as u64,
 			self.archive_header_height / HEADERS_PER_BATCH as u64,
 		);
+
+		let mut waiting_indexes: Vec<(u64, (Hash, u64))> = Vec::new();
+
+		let mut first_in_cache = 0;
+		let mut last_in_cache = 0;
+		let mut has10_idx = 0;
+		let headers_to_retry = headers_cache_size_limit as u64 / 5;
 
 		for hash_idx in base_hash_idx..=max_idx {
 			// let's check if cache already have it
 			if self
 				.main_headers_cache
+				.read()
 				.contains_key(&(hash_idx * HEADERS_PER_BATCH as u64 + 1))
 			{
+				if hash_idx == last_in_cache + 1 {
+					last_in_cache = hash_idx;
+				} else {
+					first_in_cache = hash_idx;
+					last_in_cache = hash_idx;
+				}
 				continue;
 			}
 
-			let hinfo: Option<&Hash> = headers
+			if last_in_cache > 0 {
+				if last_in_cache - first_in_cache > headers_to_retry {
+					has10_idx = first_in_cache;
+				}
+				first_in_cache = 0;
+				last_in_cache = 0;
+			}
+
+			let hinfo: Option<&Option<Hash>> = headers
 				.header_pmmr
 				.data
 				.as_ref()
 				.unwrap()
 				.get(hash_idx as usize);
 			match hinfo {
-				Some(h) => {
-					// check if already requested first
-					if !requested_hashes.contains_key(h) {
-						return_vec.push((h.clone(), hash_idx * HEADERS_PER_BATCH as u64));
-						if return_vec.len() >= elements {
-							break;
+				Some(hash) => {
+					if let Some(h) = hash {
+						let request = (h.clone(), hash_idx * HEADERS_PER_BATCH as u64);
+						// check if already requested first
+						if !request_tracker.contains_request(h) {
+							return_vec.push(request);
+							if return_vec.len() >= elements {
+								break;
+							}
+						} else {
+							waiting_indexes.push((hash_idx, request));
 						}
+					} else {
+						break;
 					}
 				}
 				None => break,
 			}
 		}
-		Ok(return_vec)
+
+		// Let's check if we want to retry something...
+		let mut retry_vec = vec![];
+		if has10_idx > 0 {
+			for (idx, req) in &waiting_indexes {
+				if *idx >= has10_idx {
+					break;
+				}
+				retry_vec.push(req.clone());
+			}
+		}
+
+		Ok((
+			return_vec,
+			retry_vec,
+			waiting_indexes.into_iter().map(|(_, v)| v).collect(),
+		))
 	}
 
 	/// Adds a output segment
-	pub fn add_headers(
-		&mut self,
+	pub fn add_headers_to_cache(
+		&self,
 		headers: &HeaderHashesDesegmenter,
 		bhs: Vec<BlockHeader>,
 		peer_info: T,
@@ -347,14 +405,16 @@ impl<T> HeadersRecieveCache<T> {
 			.expect("header_pmmr data must exist")
 			.get(hash_idx as usize + 1)
 		{
-			let last_header = bhs.last().unwrap();
-			if last_header.hash() != *next_hash {
-				return Err((
-					peer_info,
-					Error::InvalidSegment(
-						"Last header in the series doesn't match expected hash".to_string(),
-					),
-				));
+			if let Some(next_hash) = next_hash {
+				let last_header = bhs.last().unwrap();
+				if last_header.hash() != *next_hash {
+					return Err((
+						peer_info,
+						Error::InvalidSegment(
+							"Last header in the series doesn't match expected hash".to_string(),
+						),
+					));
+				}
 			}
 		}
 
@@ -369,14 +429,19 @@ impl<T> HeadersRecieveCache<T> {
 			));
 		}
 
+		let mut main_headers_cache = self.main_headers_cache.write();
 		// duplicated data, skipping it
-		if self.main_headers_cache.contains_key(&first_header.height) {
+		if main_headers_cache.contains_key(&first_header.height) {
 			return Ok(());
 		}
 
-		self.main_headers_cache
-			.insert(first_header.height, (bhs, peer_info));
+		main_headers_cache.insert(first_header.height, (bhs, peer_info));
 
+		Ok(())
+	}
+
+	/// Apply cache to the chain. Return true if more data is available
+	pub fn apply_cache(&self) -> Result<bool, (T, Error)> {
 		// Apply data from cache if possible
 		let mut headers_all: Vec<BlockHeader> = Vec::new();
 		let mut headers_by_peer: Vec<(Vec<BlockHeader>, T)> = Vec::new();
@@ -387,24 +452,31 @@ impl<T> HeadersRecieveCache<T> {
 
 		let mut tip_height = tip.height;
 
-		while let Some((height, (headers, _))) = self.main_headers_cache.first_key_value() {
-			debug_assert!(!headers.is_empty());
-			debug_assert!(headers.len() == HEADERS_PER_BATCH as usize);
-			debug_assert!(headers.first().unwrap().height == *height);
-			let ending_height = headers.last().expect("headers can't empty").height;
-			if ending_height <= tip_height {
-				// duplicated data, skipping it...
-				let _ = self.main_headers_cache.pop_first();
-				continue;
-			}
-			if *height > tip_height + 1 {
-				break;
-			}
-			let (_, (mut bhs, peer)) = self.main_headers_cache.pop_first().unwrap();
-			tip_height = bhs.last().expect("bhs can't be empty").height;
+		{
+			let mut main_headers_cache = self.main_headers_cache.write();
+			while let Some((height, (headers, _))) = main_headers_cache.first_key_value() {
+				debug_assert!(!headers.is_empty());
+				debug_assert!(headers.len() == HEADERS_PER_BATCH as usize);
+				debug_assert!(headers.first().unwrap().height == *height);
+				let ending_height = headers.last().expect("headers can't empty").height;
+				if ending_height <= tip_height {
+					// duplicated data, skipping it...
+					let _ = main_headers_cache.pop_first();
+					continue;
+				}
+				if *height > tip_height + 1 {
+					break;
+				}
+				let (_, (mut bhs, peer)) = main_headers_cache.pop_first().unwrap();
+				tip_height = bhs.last().expect("bhs can't be empty").height;
 
-			headers_by_peer.push((bhs.clone(), peer));
-			headers_all.append(&mut bhs);
+				headers_by_peer.push((bhs.clone(), peer));
+				headers_all.append(&mut bhs);
+
+				if headers_all.len() > 2000 {
+					break; //  we don't want add too much at a single session.
+				}
+			}
 		}
 
 		if !headers_all.is_empty() {
@@ -432,8 +504,18 @@ impl<T> HeadersRecieveCache<T> {
 					}
 				}
 			}
-		}
 
-		Ok(())
+			let tip = self
+				.chain
+				.header_head()
+				.expect("Header head must be always defined");
+
+			match self.main_headers_cache.read().first_key_value() {
+				Some((height, _)) => Ok(*height <= tip.height + 1),
+				None => Ok(false),
+			}
+		} else {
+			Ok(false)
+		}
 	}
 }
